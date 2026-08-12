@@ -1,7 +1,20 @@
 import { z } from "zod";
 import { getCompany, listCompanyNames } from "./companies.js";
 import { get, searchRead } from "./square.js";
-import { fetchOrders, locationsById, summarizeOrders, topItems } from "./reports.js";
+import {
+  fetchOrders,
+  fetchPayments,
+  fetchCatalogCategoryMap,
+  locationsById,
+  summarizeOrders,
+  topItems,
+  salesTrend,
+  salesByHour,
+  salesByCategory,
+  discountSummary,
+  paymentMethodBreakdown,
+  pctChange,
+} from "./reports.js";
 
 const companyField = z
   .string()
@@ -270,6 +283,158 @@ export const tools = [
       const location_ids = locationIds || Object.keys(locsById);
       const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt });
       return { company: c.name, startAt, endAt, topItems: topItems(orders, limit) };
+    },
+  },
+  {
+    name: "GET_sales_trend",
+    description:
+      "Sales trend over time for a company, bucketed by day/week/month - orders and gross sales per bucket. Use for charting growth or seasonality.",
+    inputSchema: {
+      company: companyField,
+      startAt: z.string().describe("RFC3339 start of created_at range"),
+      endAt: z.string().describe("RFC3339 end of created_at range"),
+      granularity: z.enum(["day", "week", "month"]).optional().describe("Default: day"),
+      locationIds: z.array(z.string()).optional(),
+    },
+    handler: async ({ company, startAt, endAt, granularity, locationIds }) => {
+      const c = getCompany(company);
+      const locsById = await locationsById(c.accessToken);
+      const location_ids = locationIds || Object.keys(locsById);
+      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt });
+      return { company: c.name, startAt, endAt, granularity: granularity || "day", trend: salesTrend(orders, granularity) };
+    },
+  },
+  {
+    name: "GET_sales_by_hour",
+    description:
+      "Sales broken down by hour-of-day (UTC) and day-of-week for a company over a date range - useful for staffing/rostering decisions.",
+    inputSchema: {
+      company: companyField,
+      startAt: z.string().describe("RFC3339 start of created_at range"),
+      endAt: z.string().describe("RFC3339 end of created_at range"),
+      locationIds: z.array(z.string()).optional(),
+    },
+    handler: async ({ company, startAt, endAt, locationIds }) => {
+      const c = getCompany(company);
+      const locsById = await locationsById(c.accessToken);
+      const location_ids = locationIds || Object.keys(locsById);
+      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt });
+      return { company: c.name, startAt, endAt, ...salesByHour(orders) };
+    },
+  },
+  {
+    name: "GET_sales_by_category",
+    description: "Revenue and quantity sold broken down by catalog category for a company over a date range.",
+    inputSchema: {
+      company: companyField,
+      startAt: z.string().describe("RFC3339 start of created_at range"),
+      endAt: z.string().describe("RFC3339 end of created_at range"),
+      locationIds: z.array(z.string()).optional(),
+    },
+    handler: async ({ company, startAt, endAt, locationIds }) => {
+      const c = getCompany(company);
+      const locsById = await locationsById(c.accessToken);
+      const location_ids = locationIds || Object.keys(locsById);
+      const [orders, catalogMap] = await Promise.all([
+        fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt }),
+        fetchCatalogCategoryMap(c.accessToken),
+      ]);
+      return { company: c.name, startAt, endAt, byCategory: salesByCategory(orders, catalogMap) };
+    },
+  },
+  {
+    name: "GET_discount_summary",
+    description: "Total discounts given for a company over a date range, broken down by discount name.",
+    inputSchema: {
+      company: companyField,
+      startAt: z.string().describe("RFC3339 start of created_at range"),
+      endAt: z.string().describe("RFC3339 end of created_at range"),
+      locationIds: z.array(z.string()).optional(),
+    },
+    handler: async ({ company, startAt, endAt, locationIds }) => {
+      const c = getCompany(company);
+      const locsById = await locationsById(c.accessToken);
+      const location_ids = locationIds || Object.keys(locsById);
+      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt });
+      return { company: c.name, startAt, endAt, ...discountSummary(orders) };
+    },
+  },
+  {
+    name: "GET_payment_method_breakdown",
+    description: "Payments broken down by tender/source type (card, cash, external, wallet, etc.) for a company over a date range.",
+    inputSchema: {
+      company: companyField,
+      beginTime: z.string().describe("RFC3339 start"),
+      endTime: z.string().describe("RFC3339 end"),
+    },
+    handler: async ({ company, beginTime, endTime }) => {
+      const c = getCompany(company);
+      const payments = await fetchPayments(c.accessToken, { beginTime, endTime });
+      return { company: c.name, beginTime, endTime, breakdown: paymentMethodBreakdown(payments) };
+    },
+  },
+  {
+    name: "GET_period_comparison",
+    description:
+      "Compare a company's sales between two date ranges (e.g. this month vs last month, or vs same period last year) - gross sales, order count, average order value, and % change.",
+    inputSchema: {
+      company: companyField,
+      periodAStart: z.string().describe("RFC3339 start of the baseline/earlier period"),
+      periodAEnd: z.string().describe("RFC3339 end of the baseline/earlier period"),
+      periodBStart: z.string().describe("RFC3339 start of the comparison/later period"),
+      periodBEnd: z.string().describe("RFC3339 end of the comparison/later period"),
+      locationIds: z.array(z.string()).optional(),
+    },
+    handler: async ({ company, periodAStart, periodAEnd, periodBStart, periodBEnd, locationIds }) => {
+      const c = getCompany(company);
+      const locsById = await locationsById(c.accessToken);
+      const location_ids = locationIds || Object.keys(locsById);
+      const [ordersA, ordersB] = await Promise.all([
+        fetchOrders(c.accessToken, { locationIds: location_ids, startAt: periodAStart, endAt: periodAEnd }),
+        fetchOrders(c.accessToken, { locationIds: location_ids, startAt: periodBStart, endAt: periodBEnd }),
+      ]);
+      const summaryA = summarizeOrders(ordersA, locsById);
+      const summaryB = summarizeOrders(ordersB, locsById);
+      return {
+        company: c.name,
+        periodA: { startAt: periodAStart, endAt: periodAEnd, ...summaryA },
+        periodB: { startAt: periodBStart, endAt: periodBEnd, ...summaryB },
+        change: {
+          grossSalesPct: pctChange(summaryA.grossSales, summaryB.grossSales),
+          orderCountPct: pctChange(summaryA.orderCount, summaryB.orderCount),
+          averageOrderValuePct: pctChange(summaryA.averageOrderValue, summaryB.averageOrderValue),
+        },
+      };
+    },
+  },
+  {
+    name: "GET_location_leaderboard",
+    description:
+      "Ranks every store location across ALL accessible Memory Block companies by gross sales for a date range. Slower - queries every company's Square account.",
+    inputSchema: {
+      startAt: z.string().describe("RFC3339 start of created_at range"),
+      endAt: z.string().describe("RFC3339 end of created_at range"),
+    },
+    handler: async ({ startAt, endAt }) => {
+      const leaderboard = [];
+      for (const name of listCompanyNames()) {
+        try {
+          const c = getCompany(name);
+          const locsById = await locationsById(c.accessToken);
+          const orders = await fetchOrders(c.accessToken, {
+            locationIds: Object.keys(locsById),
+            startAt,
+            endAt,
+            cap: 500,
+          });
+          const { byLocation } = summarizeOrders(orders, locsById);
+          for (const loc of byLocation) leaderboard.push({ company: name, ...loc });
+        } catch {
+          // Skip companies whose Square account can't be reached for this window
+        }
+      }
+      leaderboard.sort((a, b) => b.grossSales - a.grossSales);
+      return { startAt, endAt, leaderboard };
     },
   },
 ];

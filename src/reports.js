@@ -97,3 +97,155 @@ export async function locationsById(token) {
   const locs = await fetchLocations(token);
   return Object.fromEntries(locs.map((l) => [l.id, l]));
 }
+
+const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+export function salesTrend(orders, granularity = "day") {
+  const buckets = {};
+  for (const o of orders) {
+    if (o.state && o.state !== "COMPLETED") continue;
+    const d = new Date(o.created_at);
+    let key;
+    if (granularity === "month") {
+      key = d.toISOString().slice(0, 7);
+    } else if (granularity === "week") {
+      const dow = d.getUTCDay() || 7;
+      const monday = new Date(d);
+      monday.setUTCDate(d.getUTCDate() - dow + 1);
+      key = monday.toISOString().slice(0, 10);
+    } else {
+      key = d.toISOString().slice(0, 10);
+    }
+    if (!buckets[key]) buckets[key] = { period: key, orderCount: 0, grossSales: 0 };
+    buckets[key].orderCount += 1;
+    buckets[key].grossSales += money(o.total_money?.amount || 0);
+  }
+  return Object.values(buckets).sort((a, b) => a.period.localeCompare(b.period));
+}
+
+export function salesByHour(orders) {
+  const byHour = {};
+  const byDayOfWeek = {};
+  for (const o of orders) {
+    if (o.state && o.state !== "COMPLETED") continue;
+    const d = new Date(o.created_at);
+    const hour = d.getUTCHours();
+    const dow = DAY_NAMES[d.getUTCDay()];
+    const gross = money(o.total_money?.amount || 0);
+
+    if (!byHour[hour]) byHour[hour] = { hourUtc: hour, orderCount: 0, grossSales: 0 };
+    byHour[hour].orderCount += 1;
+    byHour[hour].grossSales += gross;
+
+    if (!byDayOfWeek[dow]) byDayOfWeek[dow] = { dayOfWeek: dow, orderCount: 0, grossSales: 0 };
+    byDayOfWeek[dow].orderCount += 1;
+    byDayOfWeek[dow].grossSales += gross;
+  }
+  return {
+    note: "hourUtc is in UTC, not store-local time - shift it by each location's timezone offset if needed.",
+    byHour: Object.values(byHour).sort((a, b) => a.hourUtc - b.hourUtc),
+    byDayOfWeek: Object.values(byDayOfWeek).sort(
+      (a, b) => DAY_NAMES.indexOf(a.dayOfWeek) - DAY_NAMES.indexOf(b.dayOfWeek)
+    ),
+  };
+}
+
+export async function fetchCatalogCategoryMap(token) {
+  const categories = {};
+  const variationToCategory = {};
+  let cursor;
+  do {
+    const page = await get(
+      token,
+      `/catalog/list?types=ITEM,CATEGORY${cursor ? `&cursor=${cursor}` : ""}`
+    );
+    for (const obj of page.objects || []) {
+      if (obj.type === "CATEGORY") {
+        categories[obj.id] = obj.category_data?.name || "Unnamed category";
+      }
+      if (obj.type === "ITEM") {
+        // Square has deprecated the singular category_id in favor of a categories array;
+        // fall back to category_id for older catalogs that never migrated.
+        const categoryId = obj.item_data?.categories?.[0]?.id || obj.item_data?.category_id;
+        for (const v of obj.item_data?.variations || []) {
+          variationToCategory[v.id] = categoryId;
+        }
+      }
+    }
+    cursor = page.cursor;
+  } while (cursor);
+  return { categories, variationToCategory };
+}
+
+export function salesByCategory(orders, catalogMap) {
+  const byCategory = {};
+  for (const o of orders) {
+    if (o.state && o.state !== "COMPLETED") continue;
+    for (const li of o.line_items || []) {
+      const categoryId = catalogMap.variationToCategory[li.catalog_object_id];
+      const name = catalogMap.categories[categoryId] || "Uncategorized";
+      if (!byCategory[name]) byCategory[name] = { category: name, quantitySold: 0, revenue: 0 };
+      byCategory[name].quantitySold += Number(li.quantity || 0);
+      byCategory[name].revenue += money(li.total_money?.amount || 0);
+    }
+  }
+  return Object.values(byCategory).sort((a, b) => b.revenue - a.revenue);
+}
+
+export function discountSummary(orders) {
+  const byName = {};
+  let totalDiscounted = 0;
+  for (const o of orders) {
+    if (o.state && o.state !== "COMPLETED") continue;
+    const discountsByUid = Object.fromEntries(
+      (o.discounts || []).map((d) => [d.uid, d.name || d.type || "Discount"])
+    );
+    for (const li of o.line_items || []) {
+      for (const ad of li.applied_discounts || []) {
+        const name = discountsByUid[ad.discount_uid] || "Discount";
+        const amt = money(ad.applied_money?.amount || 0);
+        byName[name] = (byName[name] || 0) + amt;
+        totalDiscounted += amt;
+      }
+    }
+  }
+  return {
+    totalDiscounted: Math.round(totalDiscounted * 100) / 100,
+    byDiscount: Object.entries(byName)
+      .map(([name, total]) => ({ name, totalDiscounted: Math.round(total * 100) / 100 }))
+      .sort((a, b) => b.totalDiscounted - a.totalDiscounted),
+  };
+}
+
+export async function fetchPayments(token, { beginTime, endTime, cap = MAX_ORDERS }) {
+  const payments = [];
+  let cursor;
+  do {
+    const qs = new URLSearchParams(
+      Object.entries({ begin_time: beginTime, end_time: endTime, cursor, limit: 100 }).filter(
+        ([, v]) => v !== undefined && v !== null
+      )
+    );
+    const page = await get(token, `/payments?${qs.toString()}`);
+    payments.push(...(page.payments || []));
+    cursor = page.cursor;
+  } while (cursor && payments.length < cap);
+  return payments.slice(0, cap);
+}
+
+export function paymentMethodBreakdown(payments) {
+  const byMethod = {};
+  for (const p of payments) {
+    if (p.status && p.status !== "COMPLETED") continue;
+    const method = p.source_type || "OTHER";
+    if (!byMethod[method]) byMethod[method] = { method, count: 0, total: 0 };
+    byMethod[method].count += 1;
+    byMethod[method].total += money(p.total_money?.amount || 0);
+  }
+  return Object.values(byMethod).sort((a, b) => b.total - a.total);
+}
+
+export function pctChange(before, after) {
+  if (!before) return after ? 100 : 0;
+  return Math.round(((after - before) / before) * 10000) / 100;
+}
