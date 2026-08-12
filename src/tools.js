@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { getCompany, listCompanyNames } from "./companies.js";
 import { get, searchRead } from "./square.js";
+import { fetchOrders, locationsById, summarizeOrders, topItems } from "./reports.js";
 
 const companyField = z
   .string()
@@ -44,8 +45,9 @@ export const tools = [
         const locs = await get(c.accessToken, "/locations");
         location_ids = (locs.locations || []).map((l) => l.id);
       }
+      // Square's orders/search accepts at most 10 location_ids per call
       return searchRead(c.accessToken, "/orders/search", {
-        location_ids,
+        location_ids: location_ids.slice(0, 10),
         limit,
         query: startAt || endAt
           ? { filter: { date_time_filter: { created_at: { start_at: startAt, end_at: endAt } } } }
@@ -195,6 +197,79 @@ export const tools = [
         location_ids = (locs.locations || []).map((l) => l.id);
       }
       return searchRead(c.accessToken, "/subscriptions/search", { query: { filter: { location_ids } } });
+    },
+  },
+  {
+    name: "GET_sales_summary",
+    description:
+      "Sales report for a company over a date range: gross/net sales, order count, average order value, broken down by location. Great for data analysis and exec summaries.",
+    inputSchema: {
+      company: companyField,
+      startAt: z.string().describe("RFC3339 start of created_at range, e.g. 2026-07-01T00:00:00Z"),
+      endAt: z.string().describe("RFC3339 end of created_at range, e.g. 2026-08-01T00:00:00Z"),
+      locationIds: z.array(z.string()).optional().describe("Omit for all locations"),
+    },
+    handler: async ({ company, startAt, endAt, locationIds }) => {
+      const c = getCompany(company);
+      const locsById = await locationsById(c.accessToken);
+      const location_ids = locationIds || Object.keys(locsById);
+      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt });
+      return { company: c.name, startAt, endAt, ...summarizeOrders(orders, locsById) };
+    },
+  },
+  {
+    name: "GET_sales_summary_all_companies",
+    description:
+      "Cross-company sales report for a date range: gross sales, order count, and per-company breakdown across every accessible Memory Block company. Slower - queries every company's Square account.",
+    inputSchema: {
+      startAt: z.string().describe("RFC3339 start of created_at range"),
+      endAt: z.string().describe("RFC3339 end of created_at range"),
+    },
+    handler: async ({ startAt, endAt }) => {
+      const results = [];
+      for (const name of listCompanyNames()) {
+        try {
+          const c = getCompany(name);
+          const locsById = await locationsById(c.accessToken);
+          const orders = await fetchOrders(c.accessToken, {
+            locationIds: Object.keys(locsById),
+            startAt,
+            endAt,
+            cap: 500,
+          });
+          const summary = summarizeOrders(orders, locsById);
+          results.push({ company: name, ...summary });
+        } catch (err) {
+          results.push({ company: name, error: err.message });
+        }
+      }
+      const totalGross = results.reduce((sum, r) => sum + (r.grossSales || 0), 0);
+      const totalOrders = results.reduce((sum, r) => sum + (r.orderCount || 0), 0);
+      return {
+        startAt,
+        endAt,
+        totalGrossSales: Math.round(totalGross * 100) / 100,
+        totalOrderCount: totalOrders,
+        byCompany: results.sort((a, b) => (b.grossSales || 0) - (a.grossSales || 0)),
+      };
+    },
+  },
+  {
+    name: "GET_top_items",
+    description: "Best-selling catalog items for a company over a date range, ranked by revenue.",
+    inputSchema: {
+      company: companyField,
+      startAt: z.string().describe("RFC3339 start of created_at range"),
+      endAt: z.string().describe("RFC3339 end of created_at range"),
+      limit: z.number().int().min(1).max(100).optional(),
+      locationIds: z.array(z.string()).optional(),
+    },
+    handler: async ({ company, startAt, endAt, limit, locationIds }) => {
+      const c = getCompany(company);
+      const locsById = await locationsById(c.accessToken);
+      const location_ids = locationIds || Object.keys(locsById);
+      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt });
+      return { company: c.name, startAt, endAt, topItems: topItems(orders, limit) };
     },
   },
 ];
