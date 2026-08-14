@@ -15,10 +15,30 @@ import {
   paymentMethodBreakdown,
   pctChange,
 } from "./reports.js";
+import { resolvePeriod, PERIOD_NAMES, STORE_TIMEZONE } from "./periods.js";
 
 const companyField = z
   .string()
   .describe(`Company name. One of: ${listCompanyNames().join(", ")}`);
+
+const periodField = z
+  .enum(PERIOD_NAMES)
+  .optional()
+  .describe(
+    `Named period resolved server-side (${STORE_TIMEZONE}) so the same period always means the exact same boundaries for everyone. Prefer this over startAt/endAt for anything phrased like "last month" or "this week" - it removes ambiguity that causes two people asking the same question to get different date ranges. Options: ${PERIOD_NAMES.join(", ")}.`
+  );
+
+// Resolves a canonical range: an explicit period name always wins over hand-supplied
+// startAt/endAt, so calls stay reproducible regardless of how the caller phrased the question.
+function resolveRange({ period, startAt, endAt }) {
+  if (period) return resolvePeriod(period);
+  if (!startAt || !endAt) {
+    throw new Error(
+      `Provide either "period" (one of: ${PERIOD_NAMES.join(", ")}) or both startAt and endAt.`
+    );
+  }
+  return { startAt, endAt };
+}
 
 function qs(params) {
   const entries = Object.entries(params).filter(([, v]) => v !== undefined && v !== null);
@@ -218,16 +238,18 @@ export const tools = [
       "Sales report for a company over a date range: gross/net sales, order count, average order value, broken down by location. Great for data analysis and exec summaries.",
     inputSchema: {
       company: companyField,
-      startAt: z.string().describe("RFC3339 start of created_at range, e.g. 2026-07-01T00:00:00Z"),
-      endAt: z.string().describe("RFC3339 end of created_at range, e.g. 2026-08-01T00:00:00Z"),
+      period: periodField,
+      startAt: z.string().optional().describe("RFC3339 start of created_at range, e.g. 2026-07-01T00:00:00Z. Ignored if period is set."),
+      endAt: z.string().optional().describe("RFC3339 end of created_at range, e.g. 2026-08-01T00:00:00Z. Ignored if period is set."),
       locationIds: z.array(z.string()).optional().describe("Omit for all locations"),
     },
-    handler: async ({ company, startAt, endAt, locationIds }) => {
+    handler: async ({ company, period, startAt, endAt, locationIds }) => {
+      const range = resolveRange({ period, startAt, endAt });
       const c = getCompany(company);
       const locsById = await locationsById(c.accessToken);
       const location_ids = locationIds || Object.keys(locsById);
-      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt });
-      return { company: c.name, startAt, endAt, ...summarizeOrders(orders, locsById) };
+      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, ...range });
+      return { company: c.name, ...range, ...summarizeOrders(orders, locsById) };
     },
   },
   {
@@ -235,10 +257,12 @@ export const tools = [
     description:
       "Cross-company sales report for a date range: gross sales, order count, and per-company breakdown across every accessible Memory Block company. Slower - queries every company's Square account.",
     inputSchema: {
-      startAt: z.string().describe("RFC3339 start of created_at range"),
-      endAt: z.string().describe("RFC3339 end of created_at range"),
+      period: periodField,
+      startAt: z.string().optional().describe("RFC3339 start of created_at range. Ignored if period is set."),
+      endAt: z.string().optional().describe("RFC3339 end of created_at range. Ignored if period is set."),
     },
-    handler: async ({ startAt, endAt }) => {
+    handler: async ({ period, startAt: startAtArg, endAt: endAtArg }) => {
+      const { startAt, endAt } = resolveRange({ period, startAt: startAtArg, endAt: endAtArg });
       const results = [];
       for (const name of listCompanyNames()) {
         try {
@@ -272,17 +296,19 @@ export const tools = [
     description: "Best-selling catalog items for a company over a date range, ranked by revenue.",
     inputSchema: {
       company: companyField,
-      startAt: z.string().describe("RFC3339 start of created_at range"),
-      endAt: z.string().describe("RFC3339 end of created_at range"),
+      period: periodField,
+      startAt: z.string().optional().describe("RFC3339 start of created_at range. Ignored if period is set."),
+      endAt: z.string().optional().describe("RFC3339 end of created_at range. Ignored if period is set."),
       limit: z.number().int().min(1).max(100).optional(),
       locationIds: z.array(z.string()).optional(),
     },
-    handler: async ({ company, startAt, endAt, limit, locationIds }) => {
+    handler: async ({ company, period, startAt, endAt, limit, locationIds }) => {
+      const range = resolveRange({ period, startAt, endAt });
       const c = getCompany(company);
       const locsById = await locationsById(c.accessToken);
       const location_ids = locationIds || Object.keys(locsById);
-      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt });
-      return { company: c.name, startAt, endAt, topItems: topItems(orders, limit) };
+      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, ...range });
+      return { company: c.name, ...range, topItems: topItems(orders, limit) };
     },
   },
   {
@@ -291,17 +317,19 @@ export const tools = [
       "Sales trend over time for a company, bucketed by day/week/month - orders and gross sales per bucket. Use for charting growth or seasonality.",
     inputSchema: {
       company: companyField,
-      startAt: z.string().describe("RFC3339 start of created_at range"),
-      endAt: z.string().describe("RFC3339 end of created_at range"),
+      period: periodField,
+      startAt: z.string().optional().describe("RFC3339 start of created_at range. Ignored if period is set."),
+      endAt: z.string().optional().describe("RFC3339 end of created_at range. Ignored if period is set."),
       granularity: z.enum(["day", "week", "month"]).optional().describe("Default: day"),
       locationIds: z.array(z.string()).optional(),
     },
-    handler: async ({ company, startAt, endAt, granularity, locationIds }) => {
+    handler: async ({ company, period, startAt, endAt, granularity, locationIds }) => {
+      const range = resolveRange({ period, startAt, endAt });
       const c = getCompany(company);
       const locsById = await locationsById(c.accessToken);
       const location_ids = locationIds || Object.keys(locsById);
-      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt });
-      return { company: c.name, startAt, endAt, granularity: granularity || "day", trend: salesTrend(orders, granularity) };
+      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, ...range });
+      return { company: c.name, ...range, granularity: granularity || "day", trend: salesTrend(orders, granularity) };
     },
   },
   {
@@ -310,16 +338,18 @@ export const tools = [
       "Sales broken down by hour-of-day (UTC) and day-of-week for a company over a date range - useful for staffing/rostering decisions.",
     inputSchema: {
       company: companyField,
-      startAt: z.string().describe("RFC3339 start of created_at range"),
-      endAt: z.string().describe("RFC3339 end of created_at range"),
+      period: periodField,
+      startAt: z.string().optional().describe("RFC3339 start of created_at range. Ignored if period is set."),
+      endAt: z.string().optional().describe("RFC3339 end of created_at range. Ignored if period is set."),
       locationIds: z.array(z.string()).optional(),
     },
-    handler: async ({ company, startAt, endAt, locationIds }) => {
+    handler: async ({ company, period, startAt, endAt, locationIds }) => {
+      const range = resolveRange({ period, startAt, endAt });
       const c = getCompany(company);
       const locsById = await locationsById(c.accessToken);
       const location_ids = locationIds || Object.keys(locsById);
-      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt });
-      return { company: c.name, startAt, endAt, ...salesByHour(orders) };
+      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, ...range });
+      return { company: c.name, ...range, ...salesByHour(orders) };
     },
   },
   {
@@ -327,19 +357,21 @@ export const tools = [
     description: "Revenue and quantity sold broken down by catalog category for a company over a date range.",
     inputSchema: {
       company: companyField,
-      startAt: z.string().describe("RFC3339 start of created_at range"),
-      endAt: z.string().describe("RFC3339 end of created_at range"),
+      period: periodField,
+      startAt: z.string().optional().describe("RFC3339 start of created_at range. Ignored if period is set."),
+      endAt: z.string().optional().describe("RFC3339 end of created_at range. Ignored if period is set."),
       locationIds: z.array(z.string()).optional(),
     },
-    handler: async ({ company, startAt, endAt, locationIds }) => {
+    handler: async ({ company, period, startAt, endAt, locationIds }) => {
+      const range = resolveRange({ period, startAt, endAt });
       const c = getCompany(company);
       const locsById = await locationsById(c.accessToken);
       const location_ids = locationIds || Object.keys(locsById);
       const [orders, catalogMap] = await Promise.all([
-        fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt }),
+        fetchOrders(c.accessToken, { locationIds: location_ids, ...range }),
         fetchCatalogCategoryMap(c.accessToken),
       ]);
-      return { company: c.name, startAt, endAt, byCategory: salesByCategory(orders, catalogMap) };
+      return { company: c.name, ...range, byCategory: salesByCategory(orders, catalogMap) };
     },
   },
   {
@@ -347,16 +379,18 @@ export const tools = [
     description: "Total discounts given for a company over a date range, broken down by discount name.",
     inputSchema: {
       company: companyField,
-      startAt: z.string().describe("RFC3339 start of created_at range"),
-      endAt: z.string().describe("RFC3339 end of created_at range"),
+      period: periodField,
+      startAt: z.string().optional().describe("RFC3339 start of created_at range. Ignored if period is set."),
+      endAt: z.string().optional().describe("RFC3339 end of created_at range. Ignored if period is set."),
       locationIds: z.array(z.string()).optional(),
     },
-    handler: async ({ company, startAt, endAt, locationIds }) => {
+    handler: async ({ company, period, startAt, endAt, locationIds }) => {
+      const range = resolveRange({ period, startAt, endAt });
       const c = getCompany(company);
       const locsById = await locationsById(c.accessToken);
       const location_ids = locationIds || Object.keys(locsById);
-      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, startAt, endAt });
-      return { company: c.name, startAt, endAt, ...discountSummary(orders) };
+      const orders = await fetchOrders(c.accessToken, { locationIds: location_ids, ...range });
+      return { company: c.name, ...range, ...discountSummary(orders) };
     },
   },
   {
@@ -364,41 +398,47 @@ export const tools = [
     description: "Payments broken down by tender/source type (card, cash, external, wallet, etc.) for a company over a date range.",
     inputSchema: {
       company: companyField,
-      beginTime: z.string().describe("RFC3339 start"),
-      endTime: z.string().describe("RFC3339 end"),
+      period: periodField,
+      beginTime: z.string().optional().describe("RFC3339 start. Ignored if period is set."),
+      endTime: z.string().optional().describe("RFC3339 end. Ignored if period is set."),
     },
-    handler: async ({ company, beginTime, endTime }) => {
+    handler: async ({ company, period, beginTime, endTime }) => {
+      const range = resolveRange({ period, startAt: beginTime, endAt: endTime });
       const c = getCompany(company);
-      const payments = await fetchPayments(c.accessToken, { beginTime, endTime });
-      return { company: c.name, beginTime, endTime, breakdown: paymentMethodBreakdown(payments) };
+      const payments = await fetchPayments(c.accessToken, { beginTime: range.startAt, endTime: range.endAt });
+      return { company: c.name, beginTime: range.startAt, endTime: range.endAt, breakdown: paymentMethodBreakdown(payments) };
     },
   },
   {
     name: "GET_period_comparison",
     description:
-      "Compare a company's sales between two date ranges (e.g. this month vs last month, or vs same period last year) - gross sales, order count, average order value, and % change.",
+      "Compare a company's sales between two date ranges (e.g. this month vs last month, or vs same period last year) - gross sales, order count, average order value, and % change. Prefer periodA/periodB named periods over explicit dates so 'this month vs last month' always resolves identically.",
     inputSchema: {
       company: companyField,
-      periodAStart: z.string().describe("RFC3339 start of the baseline/earlier period"),
-      periodAEnd: z.string().describe("RFC3339 end of the baseline/earlier period"),
-      periodBStart: z.string().describe("RFC3339 start of the comparison/later period"),
-      periodBEnd: z.string().describe("RFC3339 end of the comparison/later period"),
+      periodA: periodField.describe("Named period for the baseline/earlier range, e.g. last_month"),
+      periodB: periodField.describe("Named period for the comparison/later range, e.g. this_month"),
+      periodAStart: z.string().optional().describe("RFC3339 start of the baseline period. Ignored if periodA is set."),
+      periodAEnd: z.string().optional().describe("RFC3339 end of the baseline period. Ignored if periodA is set."),
+      periodBStart: z.string().optional().describe("RFC3339 start of the comparison period. Ignored if periodB is set."),
+      periodBEnd: z.string().optional().describe("RFC3339 end of the comparison period. Ignored if periodB is set."),
       locationIds: z.array(z.string()).optional(),
     },
-    handler: async ({ company, periodAStart, periodAEnd, periodBStart, periodBEnd, locationIds }) => {
+    handler: async ({ company, periodA, periodB, periodAStart, periodAEnd, periodBStart, periodBEnd, locationIds }) => {
+      const rangeA = resolveRange({ period: periodA, startAt: periodAStart, endAt: periodAEnd });
+      const rangeB = resolveRange({ period: periodB, startAt: periodBStart, endAt: periodBEnd });
       const c = getCompany(company);
       const locsById = await locationsById(c.accessToken);
       const location_ids = locationIds || Object.keys(locsById);
       const [ordersA, ordersB] = await Promise.all([
-        fetchOrders(c.accessToken, { locationIds: location_ids, startAt: periodAStart, endAt: periodAEnd }),
-        fetchOrders(c.accessToken, { locationIds: location_ids, startAt: periodBStart, endAt: periodBEnd }),
+        fetchOrders(c.accessToken, { locationIds: location_ids, ...rangeA }),
+        fetchOrders(c.accessToken, { locationIds: location_ids, ...rangeB }),
       ]);
       const summaryA = summarizeOrders(ordersA, locsById);
       const summaryB = summarizeOrders(ordersB, locsById);
       return {
         company: c.name,
-        periodA: { startAt: periodAStart, endAt: periodAEnd, ...summaryA },
-        periodB: { startAt: periodBStart, endAt: periodBEnd, ...summaryB },
+        periodA: { ...rangeA, ...summaryA },
+        periodB: { ...rangeB, ...summaryB },
         change: {
           grossSalesPct: pctChange(summaryA.grossSales, summaryB.grossSales),
           orderCountPct: pctChange(summaryA.orderCount, summaryB.orderCount),
@@ -412,10 +452,12 @@ export const tools = [
     description:
       "Ranks every store location across ALL accessible Memory Block companies by gross sales for a date range. Slower - queries every company's Square account.",
     inputSchema: {
-      startAt: z.string().describe("RFC3339 start of created_at range"),
-      endAt: z.string().describe("RFC3339 end of created_at range"),
+      period: periodField,
+      startAt: z.string().optional().describe("RFC3339 start of created_at range. Ignored if period is set."),
+      endAt: z.string().optional().describe("RFC3339 end of created_at range. Ignored if period is set."),
     },
-    handler: async ({ startAt, endAt }) => {
+    handler: async ({ period, startAt: startAtArg, endAt: endAtArg }) => {
+      const { startAt, endAt } = resolveRange({ period, startAt: startAtArg, endAt: endAtArg });
       const leaderboard = [];
       for (const name of listCompanyNames()) {
         try {
