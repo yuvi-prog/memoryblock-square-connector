@@ -43,22 +43,28 @@ function money(amountCents) {
 export function summarizeOrders(orders, locationsById = {}) {
   let grossCents = 0;
   let netCents = 0;
-  let currency = "AUD";
+  let orderCount = 0;
+  const currencies = new Set();
   const byLocation = {};
 
   for (const o of orders) {
     if (o.state && o.state !== "COMPLETED") continue; // skip open/cancelled orders
     const gross = o.total_money?.amount || 0;
     const net = (o.total_money?.amount || 0) - (o.total_discount_money?.amount || 0);
-    currency = o.total_money?.currency || currency;
+    // Fall back to the location's own configured currency (Square location object)
+    // rather than guessing AUD - MB CL Ireland's locations are EUR, for instance.
+    const currency = o.total_money?.currency || locationsById[o.location_id]?.currency || "UNKNOWN";
+    currencies.add(currency);
     grossCents += gross;
     netCents += net;
+    orderCount += 1;
 
     const locId = o.location_id;
     if (!byLocation[locId]) {
       byLocation[locId] = {
         locationId: locId,
         locationName: locationsById[locId]?.name || locId,
+        currency,
         orderCount: 0,
         grossSales: 0,
       };
@@ -67,12 +73,17 @@ export function summarizeOrders(orders, locationsById = {}) {
     byLocation[locId].grossSales += money(gross);
   }
 
+  const currency = currencies.size === 1 ? [...currencies][0] : [...currencies].join("+");
+
   return {
-    orderCount: orders.filter((o) => !o.state || o.state === "COMPLETED").length,
+    orderCount,
     grossSales: money(grossCents),
     netSales: money(netCents),
     currency,
-    averageOrderValue: orders.length ? money(grossCents / orders.length) : 0,
+    ...(currencies.size > 1 && {
+      warning: `Orders in this result use mixed currencies (${[...currencies].join(", ")}) - grossSales/netSales above are a meaningless sum across currencies. Check byLocation for per-location currency instead.`,
+    }),
+    averageOrderValue: orderCount ? money(grossCents / orderCount) : 0,
     byLocation: Object.values(byLocation).sort((a, b) => b.grossSales - a.grossSales),
   };
 }

@@ -280,13 +280,25 @@ export const tools = [
           results.push({ company: name, error: err.message });
         }
       }
-      const totalGross = results.reduce((sum, r) => sum + (r.grossSales || 0), 0);
-      const totalOrders = results.reduce((sum, r) => sum + (r.orderCount || 0), 0);
+      // Companies use different currencies (e.g. MB CL Ireland is EUR, the rest are AUD) -
+      // never sum raw amounts across currencies. Totals are grouped by currency instead.
+      const totalsByCurrency = {};
+      for (const r of results) {
+        if (!r.currency) continue;
+        if (!totalsByCurrency[r.currency]) {
+          totalsByCurrency[r.currency] = { currency: r.currency, totalGrossSales: 0, totalOrderCount: 0 };
+        }
+        totalsByCurrency[r.currency].totalGrossSales += r.grossSales || 0;
+        totalsByCurrency[r.currency].totalOrderCount += r.orderCount || 0;
+      }
+      for (const t of Object.values(totalsByCurrency)) {
+        t.totalGrossSales = Math.round(t.totalGrossSales * 100) / 100;
+      }
       return {
         startAt,
         endAt,
-        totalGrossSales: Math.round(totalGross * 100) / 100,
-        totalOrderCount: totalOrders,
+        note: "Totals are grouped by currency - do not add totals across different currencies together.",
+        totalsByCurrency: Object.values(totalsByCurrency).sort((a, b) => b.totalGrossSales - a.totalGrossSales),
         byCompany: results.sort((a, b) => (b.grossSales || 0) - (a.grossSales || 0)),
       };
     },
@@ -475,8 +487,20 @@ export const tools = [
           // Skip companies whose Square account can't be reached for this window
         }
       }
-      leaderboard.sort((a, b) => b.grossSales - a.grossSales);
-      return { startAt, endAt, leaderboard };
+      // Locations use different currencies (MB CL Ireland is EUR, the rest are AUD) -
+      // rank within each currency separately rather than mixing EUR and AUD gross sales.
+      const byCurrency = {};
+      for (const loc of leaderboard) {
+        if (!byCurrency[loc.currency]) byCurrency[loc.currency] = [];
+        byCurrency[loc.currency].push(loc);
+      }
+      for (const list of Object.values(byCurrency)) list.sort((a, b) => b.grossSales - a.grossSales);
+      return {
+        startAt,
+        endAt,
+        note: "Leaderboards are grouped by currency - a EUR location's revenue is not directly comparable to an AUD location's without a conversion.",
+        byCurrency,
+      };
     },
   },
 ];
