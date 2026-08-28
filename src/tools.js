@@ -16,6 +16,7 @@ import {
   pctChange,
 } from "./reports.js";
 import { resolvePeriod, PERIOD_NAMES, STORE_TIMEZONE } from "./periods.js";
+import { findVariations, applyPriceChange } from "./pricing.js";
 
 const companyField = z
   .string()
@@ -501,6 +502,54 @@ export const tools = [
         note: "Leaderboards are grouped by currency - a EUR location's revenue is not directly comparable to an AUD location's without a conversion.",
         byCurrency,
       };
+    },
+  },
+  {
+    name: "PREVIEW_price_change",
+    description:
+      "READ-ONLY: finds a product variation by item/variation name and shows its current live price. Does NOT change anything in Square. Always call this before SET_price and pass the exact catalogObjectId, currentPrice, and currency it returns.",
+    inputSchema: {
+      company: companyField,
+      itemName: z.string().describe("Substring to match against the catalog item name, e.g. 'Square Acrylic'"),
+      variationName: z.string().optional().describe("Substring to match against the variation name, e.g. 'Small'. Omit to see all variations of matching items."),
+    },
+    handler: async ({ company, itemName, variationName }) => {
+      const c = getCompany(company);
+      const matches = await findVariations(c.accessToken, { itemName, variationName });
+      if (!matches.length) {
+        return { company: c.name, matches: [], note: "No matching item/variation found - check spelling or widen the search." };
+      }
+      return {
+        company: c.name,
+        matches: matches.map((m) => ({
+          catalogObjectId: m.catalogObjectId,
+          itemName: m.itemName,
+          variationName: m.variationName,
+          currentPrice: m.currentPrice != null ? m.currentPrice / 100 : null,
+          currency: m.currency,
+        })),
+        note: "Nothing has been changed. To apply a new price, call SET_price with the catalogObjectId, currentPrice (as expectedCurrentPrice), and currency shown above.",
+      };
+    },
+  },
+  {
+    name: "SET_price",
+    description:
+      "WRITES to Square: overwrites the live price of ONE catalog item variation. This immediately changes what customers are charged in-store. Always call PREVIEW_price_change first and pass its exact catalogObjectId and currentPrice as expectedCurrentPrice here - if the live price has moved since your preview, this refuses to apply rather than guessing. Only price_money is touched; nothing else about the item is modified.",
+    inputSchema: {
+      company: companyField,
+      catalogObjectId: z.string().describe("Exact catalogObjectId from PREVIEW_price_change"),
+      expectedCurrentPrice: z.number().describe("The currentPrice returned by PREVIEW_price_change, in major currency units (e.g. 124.99). Must match the live price or the change is refused."),
+      newPrice: z.number().describe("The new price in major currency units, e.g. 129.99"),
+    },
+    handler: async ({ company, catalogObjectId, expectedCurrentPrice, newPrice }) => {
+      const c = getCompany(company);
+      const result = await applyPriceChange(c.accessToken, {
+        catalogObjectId,
+        expectedCurrentPriceCents: Math.round(expectedCurrentPrice * 100),
+        newPriceCents: Math.round(newPrice * 100),
+      });
+      return { company: c.name, ...result };
     },
   },
 ];

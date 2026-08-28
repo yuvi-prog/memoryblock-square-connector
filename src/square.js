@@ -30,3 +30,8 @@ export const get = (token, path) => request(token, "GET", path);
 // Still exposed here only for read operations - never anything that mutates state.
 export const searchRead = (token, path, body) =>
   request(token, "POST", path, body);
+
+// A real write to Square. Only ever called from the price-editing tools, which are
+// explicitly scoped to just price_money on an ITEM_VARIATION - never used for any
+// other mutation, and never exposed as a generic passthrough.
+export const write = (token, path, body) => request(token, "POST", path, body);
