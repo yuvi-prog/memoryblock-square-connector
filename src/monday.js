@@ -61,6 +61,154 @@ function deriveItemName(row) {
   return `${row.shape} ${row.productType}`;
 }
 
+async function fetchAllRows() {
+  const rows = [];
+  let cursor = null;
+  do {
+    const query = cursor
+      ? `query ($cursor: String!) {
+          next_items_page(cursor: $cursor, limit: 100) {
+            cursor
+            items { id column_values(ids: ${JSON.stringify(Object.values(COLUMNS))}) { id text } }
+          }
+        }`
+      : `query ($boardId: [ID!]) {
+          boards(ids: $boardId) {
+            items_page(limit: 100) {
+              cursor
+              items { id column_values(ids: ${JSON.stringify(Object.values(COLUMNS))}) { id text } }
+            }
+          }
+        }`;
+    const variables = cursor ? { cursor } : { boardId: [BOARD_ID] };
+    const data = await mondayApi(query, variables);
+    const page = cursor ? data.next_items_page : data.boards[0].items_page;
+    for (const item of page.items) {
+      const byId = Object.fromEntries(item.column_values.map((c) => [c.id, c.text]));
+      rows.push({
+        itemId: item.id,
+        sku: byId[COLUMNS.sku],
+        productType: byId[COLUMNS.productType],
+        shape: byId[COLUMNS.shape],
+        size: byId[COLUMNS.size],
+        rrp: byId[COLUMNS.rrp] ? Number(byId[COLUMNS.rrp]) : null,
+        squareTicked: byId[COLUMNS.squareToggle] === "v",
+      });
+    }
+    cursor = page.cursor;
+  } while (cursor);
+  return rows;
+}
+
+// Fetches a company's whole catalog ONCE and indexes it, so a full-board reconcile
+// doesn't re-fetch the catalog for every row (would be rows x companies calls otherwise).
+async function fetchCatalogMap(token) {
+  const map = {};
+  let cursor;
+  do {
+    const page = await get(token, `/catalog/list?types=ITEM${cursor ? `&cursor=${cursor}` : ""}`);
+    for (const item of page.objects || []) {
+      if (item.type !== "ITEM") continue;
+      map[item.item_data.name.toLowerCase()] = item;
+    }
+    cursor = page.cursor;
+  } while (cursor);
+  return map;
+}
+
+function findVariationIn(item, variationName) {
+  return item?.item_data?.variations?.find(
+    (v) => v.item_variation_data?.name?.toLowerCase() === variationName.toLowerCase()
+  );
+}
+
+// Runs the same create/hide decision as syncRow but against a pre-fetched catalog
+// map instead of hitting the network per row - used by RECONCILE_all_products.
+export async function reconcileAll() {
+  const rows = (await fetchAllRows()).filter((r) => {
+    const itemName = deriveItemName(r);
+    return itemName && r.size && r.sku;
+  });
+
+  const summary = { itemsProcessed: rows.length, wouldCreate: 0, wouldHide: 0, alreadyCorrect: 0, errors: 0, actions: [] };
+
+  for (const name of listCompanyNames()) {
+    const c = getCompany(name);
+    let catalogMap;
+    try {
+      catalogMap = await fetchCatalogMap(c.accessToken);
+    } catch (err) {
+      summary.errors += 1;
+      summary.actions.push({ company: name, error: `Could not read catalog: ${err.message}` });
+      continue;
+    }
+
+    let activeLocationIds, currency;
+
+    for (const row of rows) {
+      const itemName = deriveItemName(row);
+      const existingItem = catalogMap[itemName.toLowerCase()];
+      const existingVariation = findVariationIn(existingItem, row.size);
+
+      if (row.squareTicked) {
+        if (existingVariation) {
+          summary.alreadyCorrect += 1;
+          continue;
+        }
+        summary.wouldCreate += 1;
+        summary.actions.push({
+          company: name,
+          itemName,
+          variationName: row.size,
+          action: existingItem ? "add variation to existing item" : "create new item + variation",
+        });
+        if (SYNC_MODE === "live") {
+          try {
+            if (existingItem) {
+              await addVariationToItem(c.accessToken, existingItem, { name: row.size, sku: row.sku, price: row.rrp });
+            } else {
+              if (!activeLocationIds) {
+                const locsById = await locationsById(c.accessToken);
+                activeLocationIds = Object.entries(locsById).filter(([, l]) => l.status === "ACTIVE").map(([id]) => id);
+                currency = Object.values(locsById)[0]?.currency || "AUD";
+              }
+              const created = await createItem(c.accessToken, {
+                itemName,
+                variations: [{ name: row.size, sku: row.sku, price: row.rrp }],
+                locationIds: activeLocationIds,
+                currency,
+              });
+              // Keep the in-memory map current so a second row for the same new item
+              // (e.g. another size) adds a variation instead of creating a duplicate item.
+              catalogMap[itemName.toLowerCase()] = { id: created.catalogObjectId, item_data: { name: itemName, variations: [] } };
+            }
+          } catch (err) {
+            summary.errors += 1;
+            summary.actions.push({ company: name, itemName, variationName: row.size, error: err.message });
+          }
+        }
+      } else {
+        if (!existingVariation) {
+          summary.alreadyCorrect += 1;
+          continue;
+        }
+        summary.wouldHide += 1;
+        summary.actions.push({ company: name, itemName, variationName: row.size, action: "hide variation (remove from all locations)" });
+        if (SYNC_MODE === "live") {
+          try {
+            await hideVariation(c.accessToken, existingVariation);
+          } catch (err) {
+            summary.errors += 1;
+            summary.actions.push({ company: name, itemName, variationName: row.size, error: err.message });
+          }
+        }
+      }
+    }
+  }
+
+  return { mode: SYNC_MODE, ...summary };
+}
+
 // The core sync decision for one row. Always safe to call - only WRITES if
 // SYNC_MODE is "live"; otherwise returns the plan without touching Square.
 export async function syncRow(itemId) {

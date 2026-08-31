@@ -18,6 +18,7 @@ import {
 import { resolvePeriod, PERIOD_NAMES, STORE_TIMEZONE } from "./periods.js";
 import { findVariations, applyPriceChange } from "./pricing.js";
 import { previewCreateItem, createItem, attachItemImage } from "./catalogItems.js";
+import { reconcileAll, SYNC_MODE } from "./monday.js";
 
 const variationInput = z.object({
   name: z.string().describe("Variation name, e.g. 'XS Square'"),
@@ -616,6 +617,16 @@ export const tools = [
       const fileBuffer = Buffer.from(imageBase64, "base64");
       const result = await attachItemImage(c.accessToken, { itemName, fileBuffer, filename, mimeType, caption });
       return { company: c.name, ...result };
+    },
+  },
+  {
+    name: "RECONCILE_all_products",
+    description:
+      `Scans every row on the Monday "Products" board and, for each of the 24 companies, checks whether ticked products exist and unticked ones are hidden - catching anything that was toggled while the sync was off, not just future changes. Currently runs in ${SYNC_MODE.toUpperCase()} mode (server env var SYNC_MODE): in dry_run this only reports what it would do; in live it actually applies every create/hide. Can take a while - reads every company's full catalog once.`,
+    inputSchema: {},
+    handler: async () => {
+      const result = await reconcileAll();
+      return result;
     },
   },
 ];
