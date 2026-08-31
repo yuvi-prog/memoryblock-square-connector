@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getCompany, listCompanyNames } from "./companies.js";
+import { getCompany, listCompanyNames, listCompaniesByRegion } from "./companies.js";
 import { get, searchRead } from "./square.js";
 import {
   fetchOrders,
@@ -49,9 +49,9 @@ function qs(params) {
 export const tools = [
   {
     name: "GET_companies",
-    description: "List Memory Block companies this connector has Square access to.",
+    description: "List Memory Block companies this connector has Square access to, grouped by region (australia / world).",
     inputSchema: {},
-    handler: async () => ({ companies: listCompanyNames() }),
+    handler: async () => ({ companies: listCompanyNames(), byRegion: listCompaniesByRegion() }),
   },
   {
     name: "GET_locations",
@@ -261,11 +261,13 @@ export const tools = [
       period: periodField,
       startAt: z.string().optional().describe("RFC3339 start of created_at range. Ignored if period is set."),
       endAt: z.string().optional().describe("RFC3339 end of created_at range. Ignored if period is set."),
+      region: z.enum(["australia", "world"]).optional().describe("Omit to include every company; set to scope to just Australian or World (non-AU) companies."),
     },
-    handler: async ({ period, startAt: startAtArg, endAt: endAtArg }) => {
+    handler: async ({ period, startAt: startAtArg, endAt: endAtArg, region }) => {
       const { startAt, endAt } = resolveRange({ period, startAt: startAtArg, endAt: endAtArg });
       const results = [];
-      for (const name of listCompanyNames()) {
+      const companyNames = region ? listCompaniesByRegion()[region] : listCompanyNames();
+      for (const name of companyNames) {
         try {
           const c = getCompany(name);
           const locsById = await locationsById(c.accessToken);
@@ -468,11 +470,13 @@ export const tools = [
       period: periodField,
       startAt: z.string().optional().describe("RFC3339 start of created_at range. Ignored if period is set."),
       endAt: z.string().optional().describe("RFC3339 end of created_at range. Ignored if period is set."),
+      region: z.enum(["australia", "world"]).optional().describe("Omit to include every company; set to scope to just Australian or World (non-AU) companies."),
     },
-    handler: async ({ period, startAt: startAtArg, endAt: endAtArg }) => {
+    handler: async ({ period, startAt: startAtArg, endAt: endAtArg, region }) => {
       const { startAt, endAt } = resolveRange({ period, startAt: startAtArg, endAt: endAtArg });
       const leaderboard = [];
-      for (const name of listCompanyNames()) {
+      const companyNames = region ? listCompaniesByRegion()[region] : listCompanyNames();
+      for (const name of companyNames) {
         try {
           const c = getCompany(name);
           const locsById = await locationsById(c.accessToken);

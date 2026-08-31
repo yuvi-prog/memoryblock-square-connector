@@ -18,6 +18,18 @@ export function listCompanyNames() {
   return companies.map((c) => c.name);
 }
 
+// Groups accessible companies into "australia" and "world" so a caller doesn't have
+// to re-derive this from location country codes every time - kept as static config
+// on each company since a merchant's home country essentially never changes.
+export function listCompaniesByRegion() {
+  const grouped = { australia: [], world: [] };
+  for (const c of companies) {
+    const region = c.region === "world" ? "world" : "australia";
+    grouped[region].push(c.name);
+  }
+  return grouped;
+}
+
 export function getCompany(name) {
   const match = companies.find(
     (c) => c.name.toLowerCase() === String(name).toLowerCase()
