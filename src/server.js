@@ -31,7 +31,9 @@ function buildServer() {
 }
 
 const app = express();
-app.use(express.json());
+// Raised from Express's 100kb default so base64-encoded product images (ATTACH_item_image)
+// fit in one request; Square itself caps catalog images at 15MB.
+app.use(express.json({ limit: "20mb" }));
 
 app.use((req, res, next) => {
   const auth = req.header("authorization") || "";
