@@ -17,6 +17,13 @@ import {
 } from "./reports.js";
 import { resolvePeriod, PERIOD_NAMES, STORE_TIMEZONE } from "./periods.js";
 import { findVariations, applyPriceChange } from "./pricing.js";
+import { previewCreateItem, createItem } from "./catalogItems.js";
+
+const variationInput = z.object({
+  name: z.string().describe("Variation name, e.g. 'XS Square'"),
+  price: z.number().describe("Price in major currency units, e.g. 29.99"),
+  sku: z.string().optional(),
+});
 
 const companyField = z
   .string()
@@ -553,6 +560,42 @@ export const tools = [
         expectedCurrentPriceCents: Math.round(expectedCurrentPrice * 100),
         newPriceCents: Math.round(newPrice * 100),
       });
+      return { company: c.name, ...result };
+    },
+  },
+  {
+    name: "PREVIEW_create_item",
+    description:
+      "READ-ONLY: shows exactly what CREATE_catalog_item would create (item name, variations, target locations), and warns if an item with that name already exists. Does NOT create anything. Always call this before CREATE_catalog_item.",
+    inputSchema: {
+      company: companyField,
+      itemName: z.string().describe("Name of the new catalog item, e.g. 'Beech Wood'"),
+      variations: z.array(variationInput).min(1),
+      locationIds: z.array(z.string()).optional().describe("Square location IDs the item should be sold at. Omit to target every ACTIVE location for this company."),
+    },
+    handler: async ({ company, itemName, variations, locationIds }) => {
+      const c = getCompany(company);
+      const locsById = await locationsById(c.accessToken);
+      const targetIds = locationIds || Object.entries(locsById).filter(([, l]) => l.status === "ACTIVE").map(([id]) => id);
+      return await previewCreateItem(c.accessToken, { itemName, variations, locationIds: targetIds, locationsById: locsById });
+    },
+  },
+  {
+    name: "CREATE_catalog_item",
+    description:
+      "WRITES to Square: creates a brand-new catalog item with its variations at the given locations. Refuses if an item with the exact same name already exists, to avoid creating a duplicate. Always call PREVIEW_create_item first with the same arguments and confirm the location list and variation details look right.",
+    inputSchema: {
+      company: companyField,
+      itemName: z.string().describe("Name of the new catalog item, e.g. 'Beech Wood'"),
+      variations: z.array(variationInput).min(1),
+      locationIds: z.array(z.string()).optional().describe("Square location IDs the item should be sold at. Omit to target every ACTIVE location for this company."),
+    },
+    handler: async ({ company, itemName, variations, locationIds }) => {
+      const c = getCompany(company);
+      const locsById = await locationsById(c.accessToken);
+      const targetIds = locationIds || Object.entries(locsById).filter(([, l]) => l.status === "ACTIVE").map(([id]) => id);
+      const currency = Object.values(locsById)[0]?.currency || "AUD";
+      const result = await createItem(c.accessToken, { itemName, variations, locationIds: targetIds, currency });
       return { company: c.name, ...result };
     },
   },
