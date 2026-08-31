@@ -1,7 +1,7 @@
 // Catalog item creation. Deliberately narrow: this can only CREATE a brand-new ITEM
 // with its variations - it never edits or deletes an existing item, and price editing
 // stays in pricing.js. Kept as its own file so the two write surfaces don't blur together.
-import { get, write } from "./square.js";
+import { get, write, uploadImage } from "./square.js";
 
 export async function findItemByExactName(token, name) {
   let cursor;
@@ -78,5 +78,36 @@ export async function createItem(token, { itemName, variations, locationIds, cur
       currency: v.item_variation_data?.price_money?.currency,
     })),
     locationIds,
+  };
+}
+
+// Attaches a product photo to an existing item by exact name. Only ever touches
+// image_ids on the target ITEM - never edits price, variations, or anything else.
+export async function attachItemImage(token, { itemName, fileBuffer, filename, mimeType, caption }) {
+  const item = await findItemByExactName(token, itemName);
+  if (!item) {
+    throw new Error(`No item named "${itemName}" found - create it first with CREATE_catalog_item.`);
+  }
+
+  const result = await uploadImage(token, "/catalog/images", {
+    requestBody: {
+      idempotency_key: `attach-image-${item.id}-${Date.now()}`,
+      object_id: item.id,
+      image: {
+        type: "IMAGE",
+        id: "#new_image",
+        image_data: { caption: caption || itemName },
+      },
+    },
+    fileBuffer,
+    filename,
+    mimeType,
+  });
+
+  return {
+    itemName,
+    itemCatalogObjectId: item.id,
+    imageCatalogObjectId: result.image?.id,
+    imageUrl: result.image?.image_data?.url,
   };
 }

@@ -17,7 +17,7 @@ import {
 } from "./reports.js";
 import { resolvePeriod, PERIOD_NAMES, STORE_TIMEZONE } from "./periods.js";
 import { findVariations, applyPriceChange } from "./pricing.js";
-import { previewCreateItem, createItem } from "./catalogItems.js";
+import { previewCreateItem, createItem, attachItemImage } from "./catalogItems.js";
 
 const variationInput = z.object({
   name: z.string().describe("Variation name, e.g. 'XS Square'"),
@@ -596,6 +596,25 @@ export const tools = [
       const targetIds = locationIds || Object.entries(locsById).filter(([, l]) => l.status === "ACTIVE").map(([id]) => id);
       const currency = Object.values(locsById)[0]?.currency || "AUD";
       const result = await createItem(c.accessToken, { itemName, variations, locationIds: targetIds, currency });
+      return { company: c.name, ...result };
+    },
+  },
+  {
+    name: "ATTACH_item_image",
+    description:
+      "WRITES to Square: uploads and attaches a product photo to an existing catalog item, found by exact name. Only sets the item's image - does not touch price, variations, or anything else. Fails if no item with that exact name exists.",
+    inputSchema: {
+      company: companyField,
+      itemName: z.string().describe("Exact catalog item name to attach the image to, e.g. 'Microcement'"),
+      imageBase64: z.string().describe("The image file, base64-encoded"),
+      filename: z.string().describe("Original filename, e.g. 'microcement.png'"),
+      mimeType: z.string().describe("Image MIME type, e.g. 'image/png' or 'image/jpeg'"),
+      caption: z.string().optional(),
+    },
+    handler: async ({ company, itemName, imageBase64, filename, mimeType, caption }) => {
+      const c = getCompany(company);
+      const fileBuffer = Buffer.from(imageBase64, "base64");
+      const result = await attachItemImage(c.accessToken, { itemName, fileBuffer, filename, mimeType, caption });
       return { company: c.name, ...result };
     },
   },
