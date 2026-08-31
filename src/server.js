@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { tools } from "./tools.js";
+import { syncRow, SYNC_MODE } from "./monday.js";
 
 const PORT = process.env.PORT || 3000;
 const CONNECTOR_SECRET = process.env.CONNECTOR_SECRET;
@@ -35,7 +36,9 @@ const app = express();
 // fit in one request; Square itself caps catalog images at 15MB.
 app.use(express.json({ limit: "20mb" }));
 
-app.use((req, res, next) => {
+// The bearer-secret gate only applies to the MCP endpoint - Monday's webhook can't
+// send our secret, so it's scoped out and instead only trusts requests naming our board.
+app.use("/mcp", (req, res, next) => {
   const auth = req.header("authorization") || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
   if (token !== CONNECTOR_SECRET) {
@@ -43,6 +46,32 @@ app.use((req, res, next) => {
     return;
   }
   next();
+});
+
+const MONDAY_BOARD_ID = "5030789525";
+
+app.post("/monday-webhook", async (req, res) => {
+  // Monday's subscription handshake: echo the challenge straight back, unmodified.
+  if (req.body?.challenge) {
+    res.json({ challenge: req.body.challenge });
+    return;
+  }
+
+  const event = req.body?.event;
+  if (!event || String(event.boardId) !== MONDAY_BOARD_ID || event.columnId !== "boolean_mm6fa9h8") {
+    res.status(200).json({ ignored: true });
+    return;
+  }
+
+  // Ack immediately - Monday expects a fast response and will retry on timeout.
+  res.status(200).json({ received: true });
+
+  try {
+    const plan = await syncRow(event.pulseId);
+    console.log(`[monday-sync:${SYNC_MODE}]`, JSON.stringify(plan));
+  } catch (err) {
+    console.error("[monday-sync] failed:", err.message);
+  }
 });
 
 const transports = new Map();
@@ -76,7 +105,7 @@ app.get("/mcp", async (req, res) => {
   await transport.handleRequest(req, res);
 });
 
-app.get("/health", (req, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => res.json({ ok: true, mondaySyncMode: SYNC_MODE }));
 
 app.listen(PORT, () => {
   console.log(`Memory Block Square MCP connector listening on :${PORT}`);
