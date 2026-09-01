@@ -83,10 +83,14 @@ export async function createItem(token, { itemName, variations, locationIds, cur
 
 // Attaches a product photo to an existing item by exact name. Only ever touches
 // image_ids on the target ITEM - never edits price, variations, or anything else.
-export async function attachItemImage(token, { itemName, fileBuffer, filename, mimeType, caption }) {
+export async function attachItemImage(token, { itemName, fileBuffer, filename, mimeType, caption, skipIfImageExists = false }) {
   const item = await findItemByExactName(token, itemName);
   if (!item) {
     throw new Error(`No item named "${itemName}" found - create it first with CREATE_catalog_item.`);
+  }
+
+  if (skipIfImageExists && item.item_data.image_ids?.length) {
+    return { itemName, itemCatalogObjectId: item.id, skipped: true, reason: "Item already has an image attached." };
   }
 
   const result = await uploadImage(token, "/catalog/images", {

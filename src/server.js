@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { tools } from "./tools.js";
-import { syncRow, SYNC_MODE } from "./monday.js";
+import { syncRow, SYNC_MODE, IMAGE_COLUMN_ID } from "./monday.js";
 
 const PORT = process.env.PORT || 3000;
 const CONNECTOR_SECRET = process.env.CONNECTOR_SECRET;
@@ -57,8 +57,11 @@ app.post("/monday-webhook", async (req, res) => {
     return;
   }
 
+  // React to the Square toggle (create/hide) or the image column (attach a photo
+  // to an already-ticked, already-existing item without waiting for a re-tick).
   const event = req.body?.event;
-  if (!event || String(event.boardId) !== MONDAY_BOARD_ID || event.columnId !== "boolean_mm6fa9h8") {
+  const relevantColumns = ["boolean_mm6fa9h8", IMAGE_COLUMN_ID];
+  if (!event || String(event.boardId) !== MONDAY_BOARD_ID || !relevantColumns.includes(event.columnId)) {
     res.status(200).json({ ignored: true });
     return;
   }

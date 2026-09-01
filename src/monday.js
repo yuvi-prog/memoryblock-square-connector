@@ -2,7 +2,7 @@
 // in dry run it computes and logs exactly what it WOULD do to every company's Square
 // catalog, but never actually calls a write endpoint. Flip SYNC_MODE=live when ready.
 import { listCompanyNames, getCompany } from "./companies.js";
-import { findItemByExactName, createItem } from "./catalogItems.js";
+import { findItemByExactName, createItem, attachItemImage } from "./catalogItems.js";
 import { get, write } from "./square.js";
 import { locationsById } from "./reports.js";
 
@@ -19,6 +19,7 @@ const COLUMNS = {
   rrp: "numeric_mm6fx0r9",
   squareToggle: "boolean_mm6fa9h8",
 };
+export const IMAGE_COLUMN_ID = "file_mm6sxszf"; // "Product Images" file column
 
 export const SYNC_MODE = process.env.SYNC_MODE === "live" ? "live" : "dry_run";
 
@@ -59,6 +60,59 @@ async function fetchRow(itemId) {
 function deriveItemName(row) {
   if (!row.shape || !row.productType) return null;
   return `${row.shape} ${row.productType}`;
+}
+
+// Looks up whatever's attached to a row's file column and resolves it to a
+// downloadable Monday asset (public_url is a short-lived signed URL - fine, since
+// this is only ever used immediately, not stored).
+async function fetchRowImage(itemId) {
+  const query = `query ($itemId: [ID!]) {
+    items(ids: $itemId) {
+      column_values(ids: ["${IMAGE_COLUMN_ID}"]) {
+        ... on FileValue { files { asset_id } }
+      }
+    }
+  }`;
+  const data = await mondayApi(query, { itemId: [itemId] });
+  const assetId = data.items?.[0]?.column_values?.[0]?.files?.[0]?.asset_id;
+  if (!assetId) return null;
+
+  const assetQuery = `query ($assetIds: [ID!]) { assets(ids: $assetIds) { public_url name file_extension } }`;
+  const assetData = await mondayApi(assetQuery, { assetIds: [assetId] });
+  const asset = assetData.assets?.[0];
+  if (!asset?.public_url) return null;
+
+  const ext = (asset.file_extension || "png").toLowerCase().replace(".", "");
+  const mimeType = { jpg: "image/jpeg", jpeg: "image/jpeg", png: "image/png", webp: "image/webp", gif: "image/gif" }[ext] || "image/png";
+  return { publicUrl: asset.public_url, filename: asset.name || `image.${ext}`, mimeType };
+}
+
+async function downloadImage(publicUrl) {
+  const res = await fetch(publicUrl);
+  if (!res.ok) throw new Error(`Failed to download image from Monday (${res.status})`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+// Downloads a row's image ONCE (not once per company) and returns a ready-to-attach
+// buffer, or null if the row has no image attached.
+async function loadRowImage(itemId) {
+  const meta = await fetchRowImage(itemId);
+  if (!meta) return null;
+  const fileBuffer = await downloadImage(meta.publicUrl);
+  return { fileBuffer, filename: meta.filename, mimeType: meta.mimeType };
+}
+
+// Attaches an already-downloaded image to the Square item for one company - skips
+// if that item already has an image, so re-running the sync never re-uploads.
+async function attachImageToCompany(token, itemName, image) {
+  if (!image) return null;
+  return attachItemImage(token, {
+    itemName,
+    fileBuffer: image.fileBuffer,
+    filename: image.filename,
+    mimeType: image.mimeType,
+    skipIfImageExists: true,
+  });
 }
 
 async function fetchAllRows() {
@@ -130,7 +184,24 @@ export async function reconcileAll() {
     return itemName && r.size && r.sku;
   });
 
-  const summary = { itemsProcessed: rows.length, wouldCreate: 0, wouldHide: 0, alreadyCorrect: 0, errors: 0, actions: [] };
+  const summary = { itemsProcessed: rows.length, wouldCreate: 0, wouldHide: 0, alreadyCorrect: 0, imagesAttached: 0, errors: 0, actions: [] };
+
+  // Download each ticked row's image once (not once per company) - loaded lazily
+  // and cached per item name, since several rows (sizes) can share one Square item.
+  const imageCache = new Map();
+  async function getImageForRow(row) {
+    const itemName = deriveItemName(row);
+    if (!row.squareTicked || !itemName) return null;
+    if (imageCache.has(itemName)) return imageCache.get(itemName);
+    let image = null;
+    try {
+      image = await loadRowImage(row.itemId);
+    } catch {
+      // No image, or Monday asset fetch failed - just skip the image, don't fail the row.
+    }
+    imageCache.set(itemName, image);
+    return image;
+  }
 
   for (const name of listCompanyNames()) {
     const c = getCompany(name);
@@ -151,40 +222,54 @@ export async function reconcileAll() {
       const existingVariation = findVariationIn(existingItem, row.size);
 
       if (row.squareTicked) {
-        if (existingVariation) {
+        if (!existingVariation) {
+          summary.wouldCreate += 1;
+          summary.actions.push({
+            company: name,
+            itemName,
+            variationName: row.size,
+            action: existingItem ? "add variation to existing item" : "create new item + variation",
+          });
+          if (SYNC_MODE === "live") {
+            try {
+              if (existingItem) {
+                await addVariationToItem(c.accessToken, existingItem, { name: row.size, sku: row.sku, price: row.rrp });
+              } else {
+                if (!activeLocationIds) {
+                  const locsById = await locationsById(c.accessToken);
+                  activeLocationIds = Object.entries(locsById).filter(([, l]) => l.status === "ACTIVE").map(([id]) => id);
+                  currency = Object.values(locsById)[0]?.currency || "AUD";
+                }
+                const created = await createItem(c.accessToken, {
+                  itemName,
+                  variations: [{ name: row.size, sku: row.sku, price: row.rrp }],
+                  locationIds: activeLocationIds,
+                  currency,
+                });
+                // Keep the in-memory map current so a second row for the same new item
+                // (e.g. another size) adds a variation instead of creating a duplicate item.
+                catalogMap[itemName.toLowerCase()] = { id: created.catalogObjectId, item_data: { name: itemName, variations: [], image_ids: [] } };
+              }
+            } catch (err) {
+              summary.errors += 1;
+              summary.actions.push({ company: name, itemName, variationName: row.size, error: err.message });
+            }
+          }
+        } else {
           summary.alreadyCorrect += 1;
-          continue;
         }
-        summary.wouldCreate += 1;
-        summary.actions.push({
-          company: name,
-          itemName,
-          variationName: row.size,
-          action: existingItem ? "add variation to existing item" : "create new item + variation",
-        });
+
+        // Attach the image regardless of whether the variation (or item) was just
+        // created or already existed - covers items that predate this image feature.
         if (SYNC_MODE === "live") {
           try {
-            if (existingItem) {
-              await addVariationToItem(c.accessToken, existingItem, { name: row.size, sku: row.sku, price: row.rrp });
-            } else {
-              if (!activeLocationIds) {
-                const locsById = await locationsById(c.accessToken);
-                activeLocationIds = Object.entries(locsById).filter(([, l]) => l.status === "ACTIVE").map(([id]) => id);
-                currency = Object.values(locsById)[0]?.currency || "AUD";
-              }
-              const created = await createItem(c.accessToken, {
-                itemName,
-                variations: [{ name: row.size, sku: row.sku, price: row.rrp }],
-                locationIds: activeLocationIds,
-                currency,
-              });
-              // Keep the in-memory map current so a second row for the same new item
-              // (e.g. another size) adds a variation instead of creating a duplicate item.
-              catalogMap[itemName.toLowerCase()] = { id: created.catalogObjectId, item_data: { name: itemName, variations: [] } };
+            const image = await getImageForRow(row);
+            if (image) {
+              const result = await attachImageToCompany(c.accessToken, itemName, image);
+              if (result && !result.skipped) summary.imagesAttached += 1;
             }
           } catch (err) {
-            summary.errors += 1;
-            summary.actions.push({ company: name, itemName, variationName: row.size, error: err.message });
+            summary.actions.push({ company: name, itemName, warning: `Image attach failed: ${err.message}` });
           }
         }
       } else {
@@ -228,6 +313,16 @@ export async function syncRow(itemId) {
     perCompany: [],
   };
 
+  // Downloaded once (not once per company) and only if this row is ticked.
+  let image = null;
+  if (row.squareTicked && SYNC_MODE === "live") {
+    try {
+      image = await loadRowImage(itemId);
+    } catch {
+      // No image attached, or Monday asset fetch failed - proceed without one.
+    }
+  }
+
   for (const name of listCompanyNames()) {
     const c = getCompany(name);
     try {
@@ -239,26 +334,33 @@ export async function syncRow(itemId) {
       if (row.squareTicked) {
         if (existingVariation) {
           plan.perCompany.push({ company: name, wouldDo: "nothing - variation already exists", catalogObjectId: existingVariation.id });
-          continue;
+        } else {
+          plan.perCompany.push({
+            company: name,
+            wouldDo: existingItem ? "add variation to existing item" : "create new item + variation",
+          });
+          if (SYNC_MODE === "live") {
+            // Only ever CREATEs (item or variation) - never overwrites an existing variation's price.
+            if (existingItem) {
+              await addVariationToItem(c.accessToken, existingItem, { name: row.size, sku: row.sku, price: row.rrp });
+            } else {
+              const locsById = await locationsById(c.accessToken);
+              const activeIds = Object.entries(locsById).filter(([, l]) => l.status === "ACTIVE").map(([id]) => id);
+              const currency = Object.values(locsById)[0]?.currency || "AUD";
+              await createItem(c.accessToken, {
+                itemName,
+                variations: [{ name: row.size, sku: row.sku, price: row.rrp }],
+                locationIds: activeIds,
+                currency,
+              });
+            }
+          }
         }
-        plan.perCompany.push({
-          company: name,
-          wouldDo: existingItem ? "add variation to existing item" : "create new item + variation",
-        });
-        if (SYNC_MODE === "live") {
-          // Only ever CREATEs (item or variation) - never overwrites an existing variation's price.
-          if (existingItem) {
-            await addVariationToItem(c.accessToken, existingItem, { name: row.size, sku: row.sku, price: row.rrp });
-          } else {
-            const locsById = await locationsById(c.accessToken);
-            const activeIds = Object.entries(locsById).filter(([, l]) => l.status === "ACTIVE").map(([id]) => id);
-            const currency = Object.values(locsById)[0]?.currency || "AUD";
-            await createItem(c.accessToken, {
-              itemName,
-              variations: [{ name: row.size, sku: row.sku, price: row.rrp }],
-              locationIds: activeIds,
-              currency,
-            });
+        if (SYNC_MODE === "live" && image) {
+          try {
+            await attachImageToCompany(c.accessToken, itemName, image);
+          } catch (err) {
+            plan.perCompany.push({ company: name, warning: `Image attach failed: ${err.message}` });
           }
         }
       } else {
