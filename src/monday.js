@@ -77,7 +77,7 @@ async function fetchRowImage(itemId) {
   const assetId = data.items?.[0]?.column_values?.[0]?.files?.[0]?.asset_id;
   if (!assetId) return null;
 
-  const assetQuery = `query ($assetIds: [ID!]) { assets(ids: $assetIds) { public_url name file_extension } }`;
+  const assetQuery = `query ($assetIds: [ID!]!) { assets(ids: $assetIds) { public_url name file_extension } }`;
   const assetData = await mondayApi(assetQuery, { assetIds: [assetId] });
   const asset = assetData.assets?.[0];
   if (!asset?.public_url) return null;
