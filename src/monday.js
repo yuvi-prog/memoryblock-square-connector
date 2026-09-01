@@ -205,8 +205,8 @@ export async function reconcileAll() {
     let meta = null;
     try {
       meta = await fetchRowImage(row.itemId);
-    } catch {
-      // No image, or Monday asset fetch failed - just skip the image, don't fail the row.
+    } catch (err) {
+      console.error(`[monday-sync] fetchRowImage failed for item ${row.itemId}:`, err.message);
     }
     imageMetaCache.set(itemName, meta);
     return meta;
@@ -343,8 +343,8 @@ export async function syncRow(itemId) {
   if (row.squareTicked) {
     try {
       imageMeta = await fetchRowImage(itemId);
-    } catch {
-      // No image attached, or Monday asset fetch failed - proceed without one.
+    } catch (err) {
+      console.error(`[monday-sync] fetchRowImage failed for item ${itemId}:`, err.message);
     }
   }
 
