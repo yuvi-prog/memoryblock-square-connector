@@ -184,23 +184,32 @@ export async function reconcileAll() {
     return itemName && r.size && r.sku;
   });
 
-  const summary = { itemsProcessed: rows.length, wouldCreate: 0, wouldHide: 0, alreadyCorrect: 0, imagesAttached: 0, errors: 0, actions: [] };
+  const summary = {
+    itemsProcessed: rows.length,
+    wouldCreate: 0,
+    wouldHide: 0,
+    alreadyCorrect: 0,
+    imagesAttached: 0,
+    imagesWouldAttach: 0,
+    errors: 0,
+    actions: [],
+  };
 
-  // Download each ticked row's image once (not once per company) - loaded lazily
-  // and cached per item name, since several rows (sizes) can share one Square item.
-  const imageCache = new Map();
-  async function getImageForRow(row) {
+  // Metadata is cheap and fetched (and cached per item name) regardless of mode, so
+  // dry_run can preview it; actual bytes are only downloaded right before a live upload.
+  const imageMetaCache = new Map();
+  async function getImageMetaForRow(row) {
     const itemName = deriveItemName(row);
     if (!row.squareTicked || !itemName) return null;
-    if (imageCache.has(itemName)) return imageCache.get(itemName);
-    let image = null;
+    if (imageMetaCache.has(itemName)) return imageMetaCache.get(itemName);
+    let meta = null;
     try {
-      image = await loadRowImage(row.itemId);
+      meta = await fetchRowImage(row.itemId);
     } catch {
       // No image, or Monday asset fetch failed - just skip the image, don't fail the row.
     }
-    imageCache.set(itemName, image);
-    return image;
+    imageMetaCache.set(itemName, meta);
+    return meta;
   }
 
   for (const name of listCompanyNames()) {
@@ -259,17 +268,31 @@ export async function reconcileAll() {
           summary.alreadyCorrect += 1;
         }
 
-        // Attach the image regardless of whether the variation (or item) was just
+        // Consider the image regardless of whether the variation (or item) was just
         // created or already existed - covers items that predate this image feature.
-        if (SYNC_MODE === "live") {
-          try {
-            const image = await getImageForRow(row);
-            if (image) {
-              const result = await attachImageToCompany(c.accessToken, itemName, image);
-              if (result && !result.skipped) summary.imagesAttached += 1;
+        const imageMeta = await getImageMetaForRow(row);
+        if (imageMeta) {
+          const hasImage = catalogMap[itemName.toLowerCase()]?.item_data?.image_ids?.length > 0;
+          if (!hasImage) {
+            if (SYNC_MODE === "live") {
+              try {
+                const image = await loadRowImage(row.itemId);
+                const result = await attachImageToCompany(c.accessToken, itemName, image);
+                if (result && !result.skipped) {
+                  summary.imagesAttached += 1;
+                  // Reflect it in the cached map so a sibling size row for the same item
+                  // (checked later in this same pass) doesn't try to attach it again.
+                  const cached = catalogMap[itemName.toLowerCase()];
+                  if (cached) cached.item_data.image_ids = [result.imageCatalogObjectId];
+                }
+              } catch (err) {
+                summary.errors += 1;
+                summary.actions.push({ company: name, itemName, warning: `Image attach failed: ${err.message}` });
+              }
+            } else {
+              summary.imagesWouldAttach += 1;
+              summary.actions.push({ company: name, itemName, action: `would attach image (${imageMeta.filename})` });
             }
-          } catch (err) {
-            summary.actions.push({ company: name, itemName, warning: `Image attach failed: ${err.message}` });
           }
         }
       } else {
@@ -313,11 +336,13 @@ export async function syncRow(itemId) {
     perCompany: [],
   };
 
-  // Downloaded once (not once per company) and only if this row is ticked.
-  let image = null;
-  if (row.squareTicked && SYNC_MODE === "live") {
+  // Metadata is cheap (one Monday API call) and fetched even in dry_run, so the
+  // preview can report "would attach image" - the actual bytes are only downloaded
+  // right before an upload, in live mode.
+  let imageMeta = null;
+  if (row.squareTicked) {
     try {
-      image = await loadRowImage(itemId);
+      imageMeta = await fetchRowImage(itemId);
     } catch {
       // No image attached, or Monday asset fetch failed - proceed without one.
     }
@@ -356,11 +381,20 @@ export async function syncRow(itemId) {
             }
           }
         }
-        if (SYNC_MODE === "live" && image) {
-          try {
-            await attachImageToCompany(c.accessToken, itemName, image);
-          } catch (err) {
-            plan.perCompany.push({ company: name, warning: `Image attach failed: ${err.message}` });
+        if (imageMeta) {
+          const hasImage = existingItem?.item_data?.image_ids?.length > 0;
+          if (hasImage) {
+            plan.perCompany.push({ company: name, image: "nothing - item already has an image" });
+          } else if (SYNC_MODE === "live") {
+            try {
+              const image = await loadRowImage(itemId);
+              await attachImageToCompany(c.accessToken, itemName, image);
+              plan.perCompany.push({ company: name, image: `attached ${imageMeta.filename}` });
+            } catch (err) {
+              plan.perCompany.push({ company: name, image: `FAILED: ${err.message}` });
+            }
+          } else {
+            plan.perCompany.push({ company: name, image: `would attach ${imageMeta.filename}` });
           }
         }
       } else {
