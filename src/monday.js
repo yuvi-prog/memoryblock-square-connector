@@ -69,7 +69,7 @@ async function fetchRowImage(itemId) {
   const query = `query ($itemId: [ID!]) {
     items(ids: $itemId) {
       column_values(ids: ["${IMAGE_COLUMN_ID}"]) {
-        ... on FileValue { files { asset_id } }
+        ... on FileValue { files { ... on FileAssetValue { asset_id } } }
       }
     }
   }`;
