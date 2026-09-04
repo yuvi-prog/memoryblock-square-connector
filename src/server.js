@@ -4,6 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { tools } from "./tools.js";
 import { syncRow, SYNC_MODE, IMAGE_COLUMN_ID } from "./monday.js";
+import { registerOAuthRoutes } from "./oauth.js";
 
 const PORT = process.env.PORT || 3000;
 const CONNECTOR_SECRET = process.env.CONNECTOR_SECRET;
@@ -36,8 +37,14 @@ const app = express();
 // fit in one request; Square itself caps catalog images at 15MB.
 app.use(express.json({ limit: "20mb" }));
 
+// OAuth discovery/register/authorize/token routes - unauthenticated by design, since
+// they ARE the auth mechanism (the /authorize login page is what's gated, by secret).
+registerOAuthRoutes(app);
+
 // The bearer-secret gate only applies to the MCP endpoint - Monday's webhook can't
 // send our secret, so it's scoped out and instead only trusts requests naming our board.
+// An OAuth-issued access_token is also just this same secret (see oauth.js), so this
+// one check covers both the manual-header path and the claude.ai OAuth path.
 app.use("/mcp", (req, res, next) => {
   const auth = req.header("authorization") || "";
   const token = auth.startsWith("Bearer ") ? auth.slice(7) : undefined;
