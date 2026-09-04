@@ -33,6 +33,9 @@ function buildServer() {
 }
 
 const app = express();
+// Railway terminates TLS at its edge and forwards plain HTTP internally - without this,
+// req.protocol reads "http" and the OAuth metadata below would advertise http:// endpoints.
+app.set("trust proxy", true);
 // Raised from Express's 100kb default so base64-encoded product images (ATTACH_item_image)
 // fit in one request; Square itself caps catalog images at 15MB.
 app.use(express.json({ limit: "20mb" }));
