@@ -622,7 +622,7 @@ export const tools = [
   {
     name: "RECONCILE_all_products",
     description:
-      `Scans every row on the Monday "Products" board and, for each of the 24 companies, checks whether ticked products exist and unticked ones are hidden - catching anything that was toggled while the sync was off, not just future changes. Currently runs in ${SYNC_MODE.toUpperCase()} mode (server env var SYNC_MODE): in dry_run this only reports what it would do; in live it actually applies every create/hide. Can take a while - reads every company's full catalog once.`,
+      `Scans every row on the Monday "Products" board and, for each of the ${listCompanyNames().length} companies, checks whether ticked products exist and unticked ones are hidden - catching anything that was toggled while the sync was off, not just future changes. Currently runs in ${SYNC_MODE.toUpperCase()} mode (server env var SYNC_MODE): in dry_run this only reports what it would do; in live it actually applies every create/hide. Can take a while - reads every company's full catalog once.`,
     inputSchema: {},
     handler: async () => {
       const result = await reconcileAll();
