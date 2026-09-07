@@ -40,6 +40,15 @@ function money(amountCents) {
   return Math.round((amountCents || 0)) / 100;
 }
 
+// Square's Payment Link / Invoice orders stay in state "OPEN" forever, even once
+// fully paid - state alone isn't a reliable "did this actually sell" signal. An order
+// with nothing left owing (net_amount_due_money 0) is paid regardless of its state.
+function isPaidOrder(o) {
+  if (o.state === "COMPLETED") return true;
+  if (o.state && o.state !== "OPEN") return false; // CANCELED, DRAFT etc. are never paid
+  return o.net_amount_due_money?.amount === 0;
+}
+
 export function summarizeOrders(orders, locationsById = {}) {
   let grossCents = 0;
   let netCents = 0;
@@ -48,7 +57,7 @@ export function summarizeOrders(orders, locationsById = {}) {
   const byLocation = {};
 
   for (const o of orders) {
-    if (o.state && o.state !== "COMPLETED") continue; // skip open/cancelled orders
+    if (!isPaidOrder(o)) continue;
     const gross = o.total_money?.amount || 0;
     const net = (o.total_money?.amount || 0) - (o.total_discount_money?.amount || 0);
     // Fall back to the location's own configured currency (Square location object)
@@ -91,7 +100,7 @@ export function summarizeOrders(orders, locationsById = {}) {
 export function topItems(orders, limit = 20) {
   const items = {};
   for (const o of orders) {
-    if (o.state && o.state !== "COMPLETED") continue;
+    if (!isPaidOrder(o)) continue;
     for (const li of o.line_items || []) {
       const key = li.name || "Unknown item";
       if (!items[key]) items[key] = { name: key, quantitySold: 0, revenue: 0 };
@@ -114,7 +123,7 @@ const DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Frid
 export function salesTrend(orders, granularity = "day") {
   const buckets = {};
   for (const o of orders) {
-    if (o.state && o.state !== "COMPLETED") continue;
+    if (!isPaidOrder(o)) continue;
     const d = new Date(o.created_at);
     let key;
     if (granularity === "month") {
@@ -138,7 +147,7 @@ export function salesByHour(orders) {
   const byHour = {};
   const byDayOfWeek = {};
   for (const o of orders) {
-    if (o.state && o.state !== "COMPLETED") continue;
+    if (!isPaidOrder(o)) continue;
     const d = new Date(o.created_at);
     const hour = d.getUTCHours();
     const dow = DAY_NAMES[d.getUTCDay()];
@@ -191,7 +200,7 @@ export async function fetchCatalogCategoryMap(token) {
 export function salesByCategory(orders, catalogMap) {
   const byCategory = {};
   for (const o of orders) {
-    if (o.state && o.state !== "COMPLETED") continue;
+    if (!isPaidOrder(o)) continue;
     for (const li of o.line_items || []) {
       const categoryId = catalogMap.variationToCategory[li.catalog_object_id];
       const name = catalogMap.categories[categoryId] || "Uncategorized";
@@ -207,7 +216,7 @@ export function discountSummary(orders) {
   const byName = {};
   let totalDiscounted = 0;
   for (const o of orders) {
-    if (o.state && o.state !== "COMPLETED") continue;
+    if (!isPaidOrder(o)) continue;
     const discountsByUid = Object.fromEntries(
       (o.discounts || []).map((d) => [d.uid, d.name || d.type || "Discount"])
     );

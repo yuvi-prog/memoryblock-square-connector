@@ -242,7 +242,10 @@ export async function reconcileAll() {
           if (SYNC_MODE === "live") {
             try {
               if (existingItem) {
-                await addVariationToItem(c.accessToken, existingItem, { name: row.size, sku: row.sku, price: row.rrp });
+                const result = await addVariationToItem(c.accessToken, existingItem, { name: row.size, sku: row.sku, price: row.rrp });
+                // Without this, a second row needing another new variation on this same
+                // item later in this loop would write against a stale version and fail.
+                if (result.catalog_object) catalogMap[itemName.toLowerCase()] = result.catalog_object;
               } else {
                 if (!activeLocationIds) {
                   const locsById = await locationsById(c.accessToken);
