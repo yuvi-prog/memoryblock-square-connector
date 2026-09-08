@@ -8,6 +8,7 @@ import { locationsById } from "./reports.js";
 
 const MONDAY_API = "https://api.monday.com/v2";
 const BOARD_ID = "5030789525";
+const SETS_GROUP_TITLE = "Sets";
 
 // Column ids on the "Products" board (see get_board_info) - kept as one map so a
 // board redesign only means editing this block.
@@ -40,6 +41,8 @@ async function fetchRow(itemId) {
   const query = `query ($itemId: [ID!]) {
     items(ids: $itemId) {
       id
+      name
+      group { title }
       column_values(ids: ${JSON.stringify(Object.values(COLUMNS))}) { id text }
     }
   }`;
@@ -48,6 +51,8 @@ async function fetchRow(itemId) {
   if (!item) throw new Error(`Monday item ${itemId} not found`);
   const byId = Object.fromEntries(item.column_values.map((c) => [c.id, c.text]));
   return {
+    name: item.name,
+    isSet: item.group?.title === SETS_GROUP_TITLE,
     sku: byId[COLUMNS.sku],
     productType: byId[COLUMNS.productType],
     shape: byId[COLUMNS.shape],
@@ -57,9 +62,19 @@ async function fetchRow(itemId) {
   };
 }
 
+// Wall sets (board group "Sets") don't fit the Shape+ProductType=item / Size=variation
+// pattern: shape is fixed per set, but BOTH size and material (Product T) affect price.
+// So for these rows the item name is whatever's typed directly into the Name column
+// (e.g. "Aiya Set of 4"), and the variation combines Size + Product T (e.g. "L Pine").
 function deriveItemName(row) {
+  if (row.isSet) return row.name?.trim() || null;
   if (!row.shape || !row.productType) return null;
   return `${row.shape} ${row.productType}`;
+}
+
+function deriveVariationName(row) {
+  if (row.isSet) return row.productType ? `${row.size} ${row.productType}` : row.size;
+  return row.size;
 }
 
 // Looks up whatever's attached to a row's file column and resolves it to a
@@ -139,14 +154,14 @@ async function fetchAllRows() {
       ? `query ($cursor: String!) {
           next_items_page(cursor: $cursor, limit: 100) {
             cursor
-            items { id column_values(ids: ${JSON.stringify(Object.values(COLUMNS))}) { id text } }
+            items { id name group { title } column_values(ids: ${JSON.stringify(Object.values(COLUMNS))}) { id text } }
           }
         }`
       : `query ($boardId: [ID!]) {
           boards(ids: $boardId) {
             items_page(limit: 100) {
               cursor
-              items { id column_values(ids: ${JSON.stringify(Object.values(COLUMNS))}) { id text } }
+              items { id name group { title } column_values(ids: ${JSON.stringify(Object.values(COLUMNS))}) { id text } }
             }
           }
         }`;
@@ -157,6 +172,8 @@ async function fetchAllRows() {
       const byId = Object.fromEntries(item.column_values.map((c) => [c.id, c.text]));
       rows.push({
         itemId: item.id,
+        name: item.name,
+        isSet: item.group?.title === SETS_GROUP_TITLE,
         sku: byId[COLUMNS.sku],
         productType: byId[COLUMNS.productType],
         shape: byId[COLUMNS.shape],
@@ -197,7 +214,9 @@ function findVariationIn(item, variationName) {
 export async function reconcileAll() {
   const rows = (await fetchAllRows()).filter((r) => {
     const itemName = deriveItemName(r);
-    return itemName && r.size && r.sku;
+    // Wall sets (Sets group) are allowed a blank SKU - Square accepts a variation
+    // with no SKU. Every other product still requires one.
+    return itemName && r.size && (r.sku || r.isSet);
   });
 
   const summary = {
@@ -238,8 +257,9 @@ export async function reconcileAll() {
 
     for (const row of rows) {
       const itemName = deriveItemName(row);
+      const variationName = deriveVariationName(row);
       const existingItem = catalogMap[itemName.toLowerCase()];
-      const existingVariation = findVariationIn(existingItem, row.size);
+      const existingVariation = findVariationIn(existingItem, variationName);
 
       if (row.squareTicked) {
         if (!existingVariation) {
@@ -247,13 +267,13 @@ export async function reconcileAll() {
           summary.actions.push({
             company: name,
             itemName,
-            variationName: row.size,
+            variationName,
             action: existingItem ? "add variation to existing item" : "create new item + variation",
           });
           if (SYNC_MODE === "live") {
             try {
               if (existingItem) {
-                const result = await addVariationToItem(c.accessToken, existingItem, { name: row.size, sku: row.sku, price: row.rrp });
+                const result = await addVariationToItem(c.accessToken, existingItem, { name: variationName, sku: row.sku || undefined, price: row.rrp });
                 // Without this, a second row needing another new variation on this same
                 // item later in this loop would write against a stale version and fail.
                 if (result.catalog_object) catalogMap[itemName.toLowerCase()] = result.catalog_object;
@@ -265,7 +285,7 @@ export async function reconcileAll() {
                 }
                 const created = await createItem(c.accessToken, {
                   itemName,
-                  variations: [{ name: row.size, sku: row.sku, price: row.rrp }],
+                  variations: [{ name: variationName, sku: row.sku || undefined, price: row.rrp }],
                   locationIds: activeLocationIds,
                   currency,
                 });
@@ -275,7 +295,7 @@ export async function reconcileAll() {
               }
             } catch (err) {
               summary.errors += 1;
-              summary.actions.push({ company: name, itemName, variationName: row.size, error: err.message });
+              summary.actions.push({ company: name, itemName, variationName, error: err.message });
             }
           }
         } else {
@@ -315,13 +335,13 @@ export async function reconcileAll() {
           continue;
         }
         summary.wouldHide += 1;
-        summary.actions.push({ company: name, itemName, variationName: row.size, action: "hide variation (remove from all locations)" });
+        summary.actions.push({ company: name, itemName, variationName, action: "hide variation (remove from all locations)" });
         if (SYNC_MODE === "live") {
           try {
             await hideVariation(c.accessToken, existingVariation);
           } catch (err) {
             summary.errors += 1;
-            summary.actions.push({ company: name, itemName, variationName: row.size, error: err.message });
+            summary.actions.push({ company: name, itemName, variationName, error: err.message });
           }
         }
       }
@@ -336,7 +356,10 @@ export async function reconcileAll() {
 export async function syncRow(itemId) {
   const row = await fetchRow(itemId);
   const itemName = deriveItemName(row);
-  if (!itemName || !row.size || !row.sku) {
+  const variationName = deriveVariationName(row);
+  // Wall sets (Sets group) are allowed a blank SKU - Square accepts a variation with
+  // no SKU. Every other product still requires one.
+  if (!itemName || !row.size || (!row.sku && !row.isSet)) {
     return { itemId, skipped: true, reason: "Row is missing Shape, Product Type, Size, or SKU - can't map to a Square item." };
   }
 
@@ -344,7 +367,7 @@ export async function syncRow(itemId) {
     itemId,
     action: row.squareTicked ? "create-if-missing" : "hide-if-present",
     itemName,
-    variationName: row.size,
+    variationName,
     sku: row.sku,
     price: row.rrp,
     perCompany: [],
@@ -369,7 +392,7 @@ export async function syncRow(itemId) {
     try {
       const existingItem = await findItemByExactName(c.accessToken, itemName);
       const existingVariation = existingItem?.item_data?.variations?.find(
-        (v) => v.item_variation_data?.name?.toLowerCase() === row.size.toLowerCase()
+        (v) => v.item_variation_data?.name?.toLowerCase() === variationName.toLowerCase()
       );
 
       if (row.squareTicked) {
@@ -383,14 +406,14 @@ export async function syncRow(itemId) {
           if (SYNC_MODE === "live") {
             // Only ever CREATEs (item or variation) - never overwrites an existing variation's price.
             if (existingItem) {
-              await addVariationToItem(c.accessToken, existingItem, { name: row.size, sku: row.sku, price: row.rrp });
+              await addVariationToItem(c.accessToken, existingItem, { name: variationName, sku: row.sku || undefined, price: row.rrp });
             } else {
               const locsById = await locationsById(c.accessToken);
               const activeIds = Object.entries(locsById).filter(([, l]) => l.status === "ACTIVE").map(([id]) => id);
               const currency = Object.values(locsById)[0]?.currency || "AUD";
               await createItem(c.accessToken, {
                 itemName,
-                variations: [{ name: row.size, sku: row.sku, price: row.rrp }],
+                variations: [{ name: variationName, sku: row.sku || undefined, price: row.rrp }],
                 locationIds: activeIds,
                 currency,
               });
